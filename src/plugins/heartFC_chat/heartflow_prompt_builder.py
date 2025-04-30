@@ -175,10 +175,13 @@ class PromptBuilder:
                 current_mind_info,
                 structured_info,
                 chat_stream,
+                sender_name,
             )
         return None
 
-    async def _build_prompt_focus(self, reason, current_mind_info, structured_info, chat_stream) -> tuple[str, str]:
+    async def _build_prompt_focus(
+        self, reason, current_mind_info, structured_info, chat_stream, sender_name
+    ) -> tuple[str, str]:
         individuality = Individuality.get_instance()
         prompt_personality = individuality.get_prompt(x_person=0, level=2)
         # 日程构建
@@ -258,6 +261,7 @@ class PromptBuilder:
             reason=reason,
             prompt_ger=prompt_ger,
             moderation_prompt=await global_prompt_manager.get_prompt_async("moderation_prompt"),
+            sender_name=sender_name,
         )
 
         logger.debug(f"focus_chat_prompt: \n{prompt}")
