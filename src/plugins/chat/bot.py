@@ -1,206 +1,145 @@
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message as EventMessage, Bot
-from .message import Message,MessageSet
-from .config import BotConfig, global_config
-from .storage import MessageStorage
-from .llm_generator import ResponseGenerator
-from .message_stream import MessageStream, MessageStreamContainer
-from .topic_identifier import topic_identifier
-from random import random, choice
-from .emoji_manager import emoji_manager  # 导入表情包管理器
-import time
-import os
-from .cq_code import CQCode  # 导入CQCode模块
-from .message_send_control import message_sender  # 导入消息发送控制器
-from .message import Message_Thinking  # 导入 Message_Thinking 类
-from .relationship_manager import relationship_manager
-from .willing_manager import willing_manager  # 导入意愿管理器
-from .utils import is_mentioned_bot_in_txt, calculate_typing_time
-from ..memory_system.memory import memory_graph
+from ..moods.moods import MoodManager  # 导入情绪管理器
+from ...config.config import global_config
+from .message import MessageRecv
+from ..PFC.pfc_manager import PFCManager
+from .chat_stream import chat_manager
+from .only_message_process import MessageProcessor
+
+from src.common.logger_manager import get_logger
+from ..heartFC_chat.heartflow_processor import HeartFCProcessor
+from ..utils.prompt_builder import Prompt, global_prompt_manager
+import traceback
+
+# 定义日志配置
+
+
+# 配置主程序日志格式
+logger = get_logger("chat")
+
 
 class ChatBot:
     def __init__(self):
-        self.storage = MessageStorage()
-        self.gpt = ResponseGenerator()
         self.bot = None  # bot 实例引用
         self._started = False
-        
-        self.emoji_chance = 0.2  # 发送表情包的基础概率
-        self.message_streams = MessageStreamContainer()
-        self.message_sender = message_sender
-        
+        self.mood_manager = MoodManager.get_instance()  # 获取情绪管理器单例
+        self.heartflow_processor = HeartFCProcessor()  # 新增
+
+        # 创建初始化PFC管理器的任务，会在_ensure_started时执行
+        self.only_process_chat = MessageProcessor()
+        self.pfc_manager = PFCManager.get_instance()
+
     async def _ensure_started(self):
         """确保所有任务已启动"""
         if not self._started:
-            # 只保留必要的任务
+            logger.trace("确保ChatBot所有任务已启动")
+
             self._started = True
-                
 
-    async def handle_message(self, event: GroupMessageEvent, bot: Bot) -> None:
-        """处理收到的群消息"""
-        
-        if event.group_id not in global_config.talk_allowed_groups:
-            return
-        self.bot = bot  # 更新 bot 实例
-        
-        if event.user_id in global_config.ban_user_id:
-            return
-        
-        # 打印原始消息内容
-        '''
-        print(f"\n\033[1;33m[消息详情]\033[0m")
-        # print(f"- 原始消息: {str(event.raw_message)}")
-        print(f"- post_type: {event.post_type}")
-        print(f"- sub_type: {event.sub_type}")
-        print(f"- user_id: {event.user_id}")
-        print(f"- message_type: {event.message_type}")
-        # print(f"- message_id: {event.message_id}")
-        # print(f"- message: {event.message}")
-        print(f"- original_message: {event.original_message}")
-        print(f"- raw_message: {event.raw_message}")
-        # print(f"- font: {event.font}")
-        print(f"- sender: {event.sender}")
-        # print(f"- to_me: {event.to_me}")
-        
-        if event.reply:
-            print(f"\n\033[1;33m[回复消息详情]\033[0m")
-            # print(f"- message_id: {event.reply.message_id}")
-            print(f"- message_type: {event.reply.message_type}")
-            print(f"- sender: {event.reply.sender}")
-            # print(f"- time: {event.reply.time}")
-            print(f"- message: {event.reply.message}")
-            print(f"- raw_message: {event.reply.raw_message}")
-            # print(f"- original_message: {event.reply.original_message}")
-        '''
+    async def _create_pfc_chat(self, message: MessageRecv):
+        try:
+            chat_id = str(message.chat_stream.stream_id)
+            private_name = str(message.message_info.user_info.user_nickname)
 
-        
-        group_info = await bot.get_group_info(group_id=event.group_id)
+            if global_config.enable_pfc_chatting:
+                await self.pfc_manager.get_or_create_conversation(chat_id, private_name)
 
-        
-        
-        sender_info = await bot.get_group_member_info(group_id=event.group_id, user_id=event.user_id, no_cache=True)
-        
+        except Exception as e:
+            logger.error(f"创建PFC聊天失败: {e}")
 
-        await relationship_manager.update_relationship(user_id = event.user_id, data = sender_info)
-        await relationship_manager.update_relationship_value(user_id = event.user_id, relationship_value = 0.5)
-        # print(f"\033[1;32m[关系管理]\033[0m 更新关系值: {relationship_manager.get_relationship(event.user_id).relationship_value}")
-        
-        
-        message = Message(
-            group_id=event.group_id,
-            user_id=event.user_id,
-            message_id=event.message_id,
-            raw_message=str(event.original_message), 
-            plain_text=event.get_plaintext(),
-            reply_message=event.reply,
-        )
-        
-        current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(message.time))
+    async def message_process(self, message_data: str) -> None:
+        """处理转化后的统一格式消息
+        这个函数本质是预处理一些数据，根据配置信息和消息内容，预处理消息，并分发到合适的消息处理器中
+        heart_flow模式：使用思维流系统进行回复
+        - 包含思维流状态管理
+        - 在回复前进行观察和状态更新
+        - 回复后更新思维流状态
+        - 消息过滤
+        - 记忆激活
+        - 意愿计算
+        - 消息生成和发送
+        - 表情包处理
+        - 性能计时
+        """
+        try:
+            # 确保所有任务已启动
+            await self._ensure_started()
 
-        topic = topic_identifier.identify_topic_jieba(message.processed_plain_text)
-        print(f"\033[1;32m[主题识别]\033[0m 主题: {topic}")
-        
-        all_num = 0
-        interested_num = 0
-        if topic:
-            for current_topic in topic:
-                all_num += 1
-                first_layer_items, second_layer_items = memory_graph.get_related_item(current_topic, depth=2)
-                if first_layer_items:
-                    interested_num += 1
-                    print(f"\033[1;32m[前额叶]\033[0m 对|{current_topic}|有印象")
-        interested_rate = interested_num / all_num if all_num > 0 else 0
-        
-     
-        await self.storage.store_message(message, topic[0] if topic else None)
-        
-
-        is_mentioned = is_mentioned_bot_in_txt(message.processed_plain_text)
-        reply_probability = willing_manager.change_reply_willing_received(
-            event.group_id, 
-            topic[0] if topic else None,
-            is_mentioned,
-            global_config,
-            event.user_id,
-            message.is_emoji,
-            interested_rate
-        )
-        current_willing = willing_manager.get_willing(event.group_id)
-        
-        
-        print(f"\033[1;32m[{current_time}][{message.group_name}]{message.user_nickname}:\033[0m {message.processed_plain_text}\033[1;36m[回复意愿:{current_willing:.2f}][概率:{reply_probability:.1f}]\033[0m")
-        response = ""
-        # 创建思考消息
-        if random() < reply_probability:
-            
-            tinking_time_point = round(time.time(), 2)
-            think_id = 'mt' + str(tinking_time_point)
-            thinking_message = Message_Thinking(message=message,message_id=think_id)
-            message_sender.send_temp_container.add_message(thinking_message)
-
-            willing_manager.change_reply_willing_sent(thinking_message.group_id)
-            
-            response, emotion = await self.gpt.generate_response(message)
-            
-            # 如果生成了回复，发送并记录
-        
-        '''
-        生成回复后的内容
-        
-        '''    
-            
-        if response:
-            message_set = MessageSet(event.group_id, global_config.BOT_QQ, think_id)
-            accu_typing_time = 0
-            for msg in response:
-                print(f"当前消息: {msg}")
-                typing_time = calculate_typing_time(msg)
-                accu_typing_time += typing_time
-                timepoint = tinking_time_point+accu_typing_time
-                # print(f"\033[1;32m[调试]\033[0m 消息: {msg}，添加！, 累计打字时间: {accu_typing_time:.2f}秒")
-                
-                bot_message = Message(
-                    group_id=event.group_id,
-                    user_id=global_config.BOT_QQ,
-                    message_id=think_id,
-                    message_based_id=event.message_id,
-                    raw_message=msg,
-                    plain_text=msg,
-                    processed_plain_text=msg,
-                    user_nickname=global_config.BOT_NICKNAME,
-                    group_name=message.group_name,
-                    time=timepoint
+            if message_data["message_info"].get("group_info") is not None:
+                message_data["message_info"]["group_info"]["group_id"] = str(
+                    message_data["message_info"]["group_info"]["group_id"]
                 )
-                message_set.add_message(bot_message)
-                
-            message_sender.send_temp_container.update_thinking_message(message_set)
+            message_data["message_info"]["user_info"]["user_id"] = str(
+                message_data["message_info"]["user_info"]["user_id"]
+            )
+            logger.trace(f"处理消息:{str(message_data)[:120]}...")
+            message = MessageRecv(message_data)
+            groupinfo = message.message_info.group_info
+            userinfo = message.message_info.user_info
 
-    
-            
-            bot_response_time = tinking_time_point
-            if random() < global_config.emoji_chance:
-                emoji_path = await emoji_manager.get_emoji_for_emotion(emotion)
-                if emoji_path:
-                    emoji_cq = CQCode.create_emoji_cq(emoji_path)
-                    
-                    if random() < 0.5:
-                        bot_response_time = tinking_time_point - 1
-                    else:
-                        bot_response_time = bot_response_time + 1
-                        
-                    bot_message = Message(
-                            group_id=event.group_id,
-                            user_id=global_config.BOT_QQ,
-                            message_id=0,
-                            raw_message=emoji_cq,
-                            plain_text=emoji_cq,
-                            processed_plain_text=emoji_cq,
-                            user_nickname=global_config.BOT_NICKNAME,
-                            group_name=message.group_name,
-                            time=bot_response_time,
-                            is_emoji=True,
-                            translate_cq=False
-                        )
-                    message_sender.send_temp_container.add_message(bot_message)
-        
-        # 如果收到新消息，提高回复意愿
-        willing_manager.change_reply_willing_after_sent(event.group_id)
+            # 用户黑名单拦截
+            if userinfo.user_id in global_config.ban_user_id:
+                logger.debug(f"用户{userinfo.user_id}被禁止回复")
+                return
+
+            # 群聊黑名单拦截
+            if groupinfo != None and groupinfo.group_id not in global_config.talk_allowed_groups:
+                logger.trace(f"群{groupinfo.group_id}被禁止回复")
+                return
+
+            # 确认从接口发来的message是否有自定义的prompt模板信息
+            if message.message_info.template_info and not message.message_info.template_info.template_default:
+                template_group_name = message.message_info.template_info.template_name
+                template_items = message.message_info.template_info.template_items
+                async with global_prompt_manager.async_message_scope(template_group_name):
+                    if isinstance(template_items, dict):
+                        for k in template_items.keys():
+                            await Prompt.create_async(template_items[k], k)
+                            print(f"注册{template_items[k]},{k}")
+            else:
+                template_group_name = None
+
+            async def preprocess():
+                logger.trace("开始预处理消息...")
+                # 如果在私聊中
+                if groupinfo is None:
+                    logger.trace("检测到私聊消息")
+                    # 是否在配置信息中开启私聊模式
+                    if global_config.enable_friend_chat:
+                        logger.trace("私聊模式已启用")
+                        # 是否进入PFC
+                        if global_config.enable_pfc_chatting:
+                            logger.trace("进入PFC私聊处理流程")
+                            userinfo = message.message_info.user_info
+                            messageinfo = message.message_info
+                            # 创建聊天流
+                            logger.trace(f"为{userinfo.user_id}创建/获取聊天流")
+                            chat = await chat_manager.get_or_create_stream(
+                                platform=messageinfo.platform,
+                                user_info=userinfo,
+                                group_info=groupinfo,
+                            )
+                            message.update_chat_stream(chat)
+                            await self.only_process_chat.process_message(message)
+                            await self._create_pfc_chat(message)
+                        # 禁止PFC，进入普通的心流消息处理逻辑
+                        else:
+                            logger.trace("进入普通心流私聊处理")
+                            await self.heartflow_processor.process_message(message_data)
+                # 群聊默认进入心流消息处理逻辑
+                else:
+                    logger.trace(f"检测到群聊消息，群ID: {groupinfo.group_id}")
+                    await self.heartflow_processor.process_message(message_data)
+
+            if template_group_name:
+                async with global_prompt_manager.async_message_scope(template_group_name):
+                    await preprocess()
+            else:
+                await preprocess()
+
+        except Exception as e:
+            logger.error(f"预处理消息失败: {e}")
+            traceback.print_exc()
+
+
+# 创建全局ChatBot实例
+chat_bot = ChatBot()
